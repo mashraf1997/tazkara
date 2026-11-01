@@ -1,0 +1,40 @@
+{
+  "name": "tazkara",
+  "version": "1.0.0",
+  "description": "Self-hosted event ticketing: event pages, free or paid tickets (InstaPay, wallets, payment links), QR tickets on WhatsApp and a door scanner. 8 languages, zero fees.",
+  "main": "server.js",
+  "license": "MIT",
+  "author": "mashraf1997",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mashraf1997/tazkara.git"
+  },
+  "keywords": [
+    "tickets",
+    "ticketing",
+    "events",
+    "qr-code",
+    "check-in",
+    "event-management",
+    "whatsapp",
+    "workshops",
+    "concerts",
+    "self-hosted",
+    "arabic",
+    "rtl",
+    "hostinger"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "qrcode": "^1.5.4",
+    "jsqr": "^1.4.0"
+  }
+}
