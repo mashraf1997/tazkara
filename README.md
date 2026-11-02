@@ -9,6 +9,8 @@ Event pages, free or paid tickets, QR tickets on WhatsApp and a door scanner on 
 
 [![Deploy on Hostinger](https://assets.hostinger.com/vps/deploy.svg)](https://www.hostinger.com/docker-hosting?compose_url=https://raw.githubusercontent.com/mashraf1997/tazkara/main/docker-compose.yml&REFERRALCODE=YOUR_REFERRAL_CODE)
 
+<sub>Part of a free suite of four apps for small businesses: <a href="https://mashraf1997.github.io/">mashraf1997.github.io</a></sub>
+
 [English](README.md) · [العربية](README.ar.md)
 
 </div>
