@@ -15,7 +15,11 @@
         const s = document.createElement('script');
         s.src = '/js/jsqr.js';
         s.onload = () => resolve(window.jsQR);
-        s.onerror = reject;
+        s.onerror = (e) => {
+          jsqrPromise = null; // allow a retry later
+          s.remove();
+          reject(e);
+        };
         document.head.appendChild(s);
       });
     }
@@ -112,5 +116,9 @@
     } catch { /* no audio */ }
   }
 
-  window.QrScanner = { start, beep };
+  // Fetch the fallback decoder up front where it will be needed, so the
+  // camera still works if the network drops later (offline door mode).
+  const preload = () => ('BarcodeDetector' in window ? Promise.resolve() : loadJsQR()).catch(() => {});
+
+  window.QrScanner = { start, beep, preload };
 })();

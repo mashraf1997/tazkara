@@ -16,6 +16,11 @@ const T = require('./tickets');
 const { loadSample, EVENT_TYPES } = require('./sample');
 const { resetDemo } = require('./demo');
 const notify = require('./notify');
+const payments = require('./payments');
+const wa = require('./whatsapp');
+const mailer = require('./mailer');
+const push = require('./push');
+const backup = require('./backup');
 const V = require('./views');
 const { toCsv } = require('./csv');
 
@@ -154,7 +159,7 @@ function intlPhone(phone, ownWhatsapp) {
   return digits;
 }
 
-function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = null }) {
+function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = null, branding = null }) {
   const store = new Store(dataDir);
   const app = express();
   const now = () => (clock ? clock() : D.nowIn(store.settings.timezone));
@@ -200,6 +205,104 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
   const notInDemo = (req, res, next) => (demo ? res.status(403).json({ error: 'demo' }) : next());
   const requireHeader = (req, res, next) => (req.method === 'GET' || req.get('x-tazkara') === '1' ? next() : res.status(403).json({ error: 'forbidden' }));
   const hold = () => store.settings.holdHours;
+
+  // ---------- integrations ----------
+  // Links in messages sent from background jobs (webhooks, reminders) use the
+  // last public address the app was reached on.
+  const rememberBase = (req) => {
+    const b = baseUrl(req);
+    if (store.db.publicUrl !== b && !/\/\/(localhost|127\.0\.0\.1)[:/]/.test(b)) {
+      store.db.publicUrl = b;
+      store.save();
+    }
+  };
+  const publicBase = () => store.db.publicUrl || `http://localhost:${process.env.PORT || 3000}/`;
+  const snapshot = () => {
+    const { settings, events, nextOrderNo } = store.db;
+    return { app: 'tazkara', version: 1, exportedAt: new Date().toISOString(), settings, events, nextOrderNo, orders: store.orders, tickets: store.tickets };
+  };
+  const brand = () => ({ name: store.settings.name, color: store.settings.color });
+  const tx = () => strings(store.settings.lang);
+  const firstName = (n) => String(n || '').trim().split(/\s+/)[0] || '';
+  const WA_KINDS = [
+    { key: 'tickets', defaultName: 'tazkara_tickets', params: ['name', 'event', 'when', 'link'], sample: { en: 'Hi {{1}}! Your tickets for {{2}} ({{3}}) are confirmed 🎟️ Open them here: {{4}}', ar: 'أهلًا يا {{1}}! تذاكرك لـ {{2}} ({{3}}) اتأكدت 🎟️ افتحها من هنا: {{4}}' } },
+    { key: 'reminder', defaultName: 'tazkara_reminder', params: ['name', 'event', 'when', 'venue', 'link'], sample: { en: 'Hi {{1}}, see you tomorrow at {{2}}: {{3}} at {{4}}. Your tickets: {{5}}', ar: 'أهلًا يا {{1}}، مستنيينك بكرة في {{2}}: {{3}} في {{4}}. تذاكرك: {{5}}' } },
+  ];
+
+  const autoWa = (kind) => {
+    const c = wa.cfgOf(store);
+    return wa.ready(c) && !!(c.templates[kind] || {}).enabled;
+  };
+
+  /** Tickets are valid: send them by WhatsApp (API) and email when possible. */
+  function deliverTickets(o, base) {
+    const e = store.event(o.eventId);
+    if (!e) return;
+    const t = tx();
+    const url = `${base}o/${o.token}`;
+    const when = T.whenLine(e, store.settings.lang);
+    wa.sendInBackground(store, 'tickets', intlPhone(o.customer.phone, store.settings.whatsapp), [firstName(o.customer.name), e.title, when, url]);
+    if (o.customer.email) {
+      const { html, text } = mailer.render({ brand: brand(), dir: t.dir, title: T.fill(t.mailTicketsTitle, { event: e.title }), body: T.fill(t.mailTicketsBody, { name: firstName(o.customer.name), n: o.count, event: e.title, when, venue: [e.venue, e.address].filter(Boolean).join(', ') }), button: { label: t.mailOpenTickets, url }, footer: store.settings.policy || '' });
+      mailer.sendInBackground(store, { to: o.customer.email, subject: T.fill(t.mailTicketsTitle, { event: e.title }), html, text, attachments: [{ filename: `${e.slug}.ics`, content: T.ics(e, store.settings, `${base}e/${e.slug}`), contentType: 'text/calendar' }] });
+    }
+  }
+
+  function askForPayment(o, base) {
+    const e = store.event(o.eventId);
+    if (!e || !o.customer.email) return;
+    const t = tx();
+    const s = store.settings;
+    const { html, text } = mailer.render({ brand: brand(), dir: t.dir, title: T.fill(t.mailPayTitle, { event: e.title }), body: [T.fill(t.mailPayBody, { name: firstName(o.customer.name), n: o.count, amount: T.formatMoney(o.total, s.currency) }), s.paymentInfo || '', s.holdHours ? T.fill(t.holdHint, { hours: s.holdHours }) : ''].filter(Boolean).join('\n\n'), button: { label: t.mailPayButton, url: `${base}o/${o.token}` } });
+    mailer.sendInBackground(store, { to: o.customer.email, subject: T.fill(t.mailPayTitle, { event: e.title }), html, text });
+  }
+
+  function markOrderPaid(o, base, via) {
+    if (o.status === 'paid') return false;
+    store.updateOrder(o.id, { status: 'paid', paidAt: new Date(nowMs()).toISOString(), paidVia: via });
+    deliverTickets(o, base);
+    return true;
+  }
+
+  // Online payments land here (from the return page or a webhook), exactly once.
+  async function onPaid(kind, id, info) {
+    if (kind !== 'order') return;
+    const o = store.order(id);
+    if (!o) return;
+    const e = store.event(o.eventId);
+    markOrderPaid(o, publicBase(), info.provider);
+    notify.alertOwner(store, `💳 *${tx().msgPaidOnline} #${o.no}*\n${e ? e.title : ''}\n${T.formatMoney(info.amount, store.settings.currency)} · ${o.customer.name}`, { url: `${publicBase()}admin#orders`, path: '/admin#orders' });
+  }
+
+  /** The day before an event (after 10:00): remind ticket holders. */
+  function sendReminders() {
+    const n = now();
+    if (n.minutes < 10 * 60) return 0;
+    const tomorrow = D.addDays(n.date, 1);
+    const waOn = wa.ready(wa.cfgOf(store)) && (wa.cfgOf(store).templates.reminder || {}).enabled;
+    const mailOn = mailer.ready(mailer.cfgOf(store));
+    if (!waOn && !mailOn) return 0;
+    const t = tx();
+    let sent = 0;
+    for (const e of store.db.events.filter((x) => x.date === tomorrow && x.published)) {
+      const when = T.whenLine(e, store.settings.lang);
+      for (const o of store.orders.filter((x) => x.eventId === e.id && x.status === 'paid' && !x.reminded)) {
+        const url = `${publicBase()}o/${o.token}`;
+        if (waOn) wa.sendInBackground(store, 'reminder', intlPhone(o.customer.phone, store.settings.whatsapp), [firstName(o.customer.name), e.title, when, e.venue || e.address || '-', url]);
+        if (mailOn && o.customer.email) {
+          const { html, text } = mailer.render({ brand: brand(), dir: t.dir, title: T.fill(t.mailReminderTitle, { event: e.title }), body: T.fill(t.mailReminderBody, { name: firstName(o.customer.name), event: e.title, when, venue: [e.venue, e.address].filter(Boolean).join(', ') }), button: { label: t.mailOpenTickets, url } });
+          mailer.sendInBackground(store, { to: o.customer.email, subject: T.fill(t.mailReminderTitle, { event: e.title }), html, text });
+        }
+        o.reminded = true;
+        sent++;
+      }
+    }
+    if (sent) store.saveList('orders');
+    return sent;
+  }
+
+  // White-label (agency mode): the hub can rename the "powered by" line.
+  const viewSettings = () => (branding ? { ...store.settings, _brand: branding() } : store.settings);
 
   /** Order status as people should see it (an unpaid order past its hold time shows as expired). */
   const orderState = (o) => (T.isExpired(o, hold(), nowMs()) ? 'expired' : o.status);
@@ -249,6 +352,7 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     return { ok: true, reason: '', usedAt: ticket.usedAt, ...info };
   }
 
+  payments.mountPublic(app, store, express, { onPaid });
   app.use(express.static(PUBLIC_DIR, { maxAge: '1h', index: false }));
   app.use('/uploads', express.static(store.uploadsDir, { maxAge: '30d', immutable: true }));
   app.get('/js/jsqr.js', (req, res) => res.set('Cache-Control', 'public, max-age=86400').type('js').sendFile(JSQR));
@@ -268,7 +372,7 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     const n = now();
     const events = publicEvents().map((e) => ({ ...e, stats: eventStats(e), past: T.isPast(e, n) }));
     res.setHeader('Cache-Control', 'no-cache');
-    res.type('html').send(V.renderHome({ settings: store.settings, events, lang: pickLang(req), baseUrl: baseUrl(req), now: n, demo: !!demo, preview: req.query.preview === '1', languages: LANGUAGES }));
+    res.type('html').send(V.renderHome({ settings: viewSettings(), events, lang: pickLang(req), baseUrl: baseUrl(req), now: n, demo: !!demo, preview: req.query.preview === '1', languages: LANGUAGES }));
   });
 
   app.get('/e/:slug.ics', (req, res) => {
@@ -287,7 +391,7 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     res.setHeader('Cache-Control', 'no-cache');
     res.type('html').send(
       V.renderEventPage({
-        settings: store.settings,
+        settings: viewSettings(),
         event: e,
         avail: T.availability(e, store.orders, hold(), nowMs()),
         open: T.salesOpen(e, n),
@@ -313,7 +417,7 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     if (!o) return res.status(404).type('html').send(V.renderNotFound({ settings: store.settings, lang: pickLang(req) }));
     const e = store.event(o.eventId);
     const tickets = await Promise.all(store.ticketsOf(o.id).map(async (t) => ({ ...t, url: `${baseUrl(req)}t/${t.token}`, qr: await qrSvg(`${baseUrl(req)}t/${t.token}`) })));
-    res.type('html').send(V.renderOrderPage({ settings: store.settings, order: o, state: orderState(o), event: e, tickets, lang: pickLang(req), baseUrl: baseUrl(req) }));
+    res.type('html').send(V.renderOrderPage({ settings: viewSettings(), order: o, state: orderState(o), event: e, tickets, lang: pickLang(req), baseUrl: baseUrl(req), payOnline: payments.ready(payments.cfgOf(store)) && !demo, payPending: req.query.pay === 'pending' }));
   });
 
   app.get('/t/:token', async (req, res) => {
@@ -356,6 +460,7 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
       demo: demo ? { password: demo.password, resetMinutes: demo.resetMinutes } : null,
       languages: LANGUAGES,
       eventTypes: EVENT_TYPES,
+      brand: branding ? branding() : null,
     });
   });
 
@@ -367,7 +472,10 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     const r = T.buildOrder(b, { event, orders: store.orders, settings: store.settings, now: now(), nowMs: nowMs() });
     if (r.error) return res.status(r.error === 'sold_out' ? 409 : 400).json(r);
     const o = store.addOrder(r.order, T.ticketsFor);
-    notify.notifyInBackground(store.db.notify, `${T.newOrderMessage(o, event, store.settings)}\n\n🔗 ${baseUrl(req)}admin#orders`);
+    rememberBase(req);
+    notify.alertOwner(store, T.newOrderMessage(o, event, store.settings), { url: `${baseUrl(req)}admin#orders`, path: '/admin#orders' });
+    if (o.status === 'paid') deliverTickets(o, baseUrl(req));
+    else askForPayment(o, baseUrl(req));
     const s = store.settings;
     const receipt = T.fill(strings(s.lang).receiptText, { no: o.no, name: o.customer.name, event: event.title });
     res.json({
@@ -379,7 +487,23 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
       paymentInfo: o.status === 'pending' ? s.paymentInfo : '',
       paymentLink: o.status === 'pending' ? s.paymentLink : '',
       receiptUrl: o.status === 'pending' && s.whatsapp ? T.whatsappUrl(s.whatsapp, receipt) : '',
+      payOnline: o.status === 'pending' && payments.ready(payments.cfgOf(store)),
     });
+  });
+
+  // Pay a pending order online (Stripe / Paymob).
+  api.post('/orders/:token/checkout', async (req, res) => {
+    if (orderLimited(req.ip)) return res.status(429).json({ error: 'rate_limited' });
+    const o = store.orderByToken(req.params.token);
+    if (!o) return res.status(404).json({ error: 'not_found' });
+    if (orderState(o) !== 'pending') return res.status(400).json({ error: 'not_payable' });
+    const e = store.event(o.eventId);
+    try {
+      const r = await payments.createCheckout(store, baseUrl(req), { kind: 'order', id: o.id, amount: o.total, title: `${e ? e.title : store.settings.name} · #${o.no}`, customer: o.customer, returnTo: `/o/${o.token}` });
+      res.json({ url: r.url });
+    } catch (err) {
+      res.status(400).json({ error: err.code || 'provider_error' });
+    }
   });
 
   // Buyers can put a friend's name on each ticket before forwarding it.
@@ -414,6 +538,52 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     const r = doCheckIn(t, e, 'door');
     const st = eventStats(e);
     res.json({ ...r, checkedIn: st.checkedIn, sold: st.sold });
+  });
+
+  // Offline door mode: the scanner keeps a list of this event's tickets
+  // (hashed codes only, so the list can't be turned into ticket links) and
+  // checks people in locally when the venue's internet drops, then syncs.
+  const codeHash = (token) => crypto.createHash('sha256').update(String(token)).digest('hex').slice(0, 24);
+  api.get('/scan/:token/list', (req, res) => {
+    if (scanLimited(req.ip)) return res.status(429).json({ error: 'rate_limited' });
+    const e = scanEvent(req, res);
+    if (!e) return;
+    const orders = new Map(store.orders.filter((o) => o.eventId === e.id).map((o) => [o.id, o]));
+    const tickets = store.tickets
+      .filter((t) => t.eventId === e.id)
+      .map((t) => {
+        const o = orders.get(t.orderId);
+        return { h: codeHash(t.token), holder: t.holder || (o ? o.customer.name : ''), typeName: t.typeName, seq: t.seq, of: o ? o.count : 1, orderNo: o ? o.no : '', reason: T.ticketProblem(t, o && { ...o, status: orderState(o) }, e), usedAt: t.usedAt || '' };
+      });
+    const st = eventStats(e);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ at: new Date(nowMs()).toISOString(), eventTitle: e.title, tickets, checkedIn: st.checkedIn, sold: st.sold });
+  });
+  api.post('/scan/:token/sync', (req, res) => {
+    if (scanLimited(req.ip)) return res.status(429).json({ error: 'rate_limited' });
+    const e = scanEvent(req, res);
+    if (!e) return;
+    const scans = Array.isArray((req.body || {}).scans) ? req.body.scans.slice(0, 2000) : [];
+    const results = [];
+    for (const sc of scans) {
+      const t = store.ticketByToken(T.tokenFromCode(sc && sc.code));
+      if (!t) {
+        results.push({ code: String((sc && sc.code) || '').slice(0, 60), ok: false, reason: 'unknown' });
+        continue;
+      }
+      const at = Date.parse(sc.at);
+      const r = doCheckIn(t, e, 'door-offline');
+      // Keep the real time the guest walked in (never in the future).
+      if (r.ok && at && at < nowMs() && at > nowMs() - 2 * 864e5) {
+        t.usedAt = new Date(at).toISOString();
+        store.saveList('tickets');
+      }
+      // The same offline scan sent twice (a lost response) is not a conflict.
+      const again = !r.ok && r.reason === 'used' && at && t.usedAt === new Date(at).toISOString();
+      results.push({ code: t.token, ok: r.ok || again, reason: again ? '' : r.reason, holder: r.holder, usedAt: t.usedAt });
+    }
+    const st = eventStats(e);
+    res.json({ results, conflicts: results.filter((r) => !r.ok && r.reason === 'used').length, checkedIn: st.checkedIn, sold: st.sold });
   });
 
   api.post('/setup', notInDemo, (req, res) => {
@@ -452,6 +622,15 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
   const admin = express.Router();
   admin.use(requireAuth);
   notify.mountRoutes(admin, store, { guard: notInDemo, appName: 'Tazkara' });
+  payments.mountAdmin(admin, store, { guard: notInDemo, baseUrl });
+  wa.mountAdmin(admin, store, { guard: notInDemo, kinds: WA_KINDS });
+  mailer.mountAdmin(admin, store, { guard: notInDemo, appName: 'Tazkara' });
+  push.mountAdmin(admin, store, { appName: 'Tazkara' });
+  backup.mountAdmin(admin, store, { snapshot, guard: notInDemo, appName: 'Tazkara' });
+  admin.use((req, res, next) => {
+    rememberBase(req);
+    next();
+  });
 
   const eventView = (req, e) => ({ ...e, stats: eventStats(e), past: T.isPast(e, now()), url: `${baseUrl(req)}e/${e.slug}`, scanUrl: scanUrl(req, e) });
 
@@ -582,7 +761,8 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     const r = T.buildOrder({ ...b, paid: b.paid !== false && b.paid !== 'false' }, { event, orders: store.orders, settings: store.settings, now: now(), admin: true, nowMs: nowMs() });
     if (r.error) return res.status(r.error === 'sold_out' ? 409 : 400).json(r);
     const o = store.addOrder(r.order, T.ticketsFor);
-    res.json({ ...orderRow(o), orderUrl: orderUrl(req, o), whatsappUrl: T.whatsappUrl(intlPhone(o.customer.phone, store.settings.whatsapp), T.orderMessage(o, event, store.settings, orderUrl(req, o))) });
+    if (o.status === 'paid') deliverTickets(o, baseUrl(req));
+    res.json({ ...orderRow(o), autoSent: o.status === 'paid' && autoWa('tickets'), orderUrl: orderUrl(req, o), whatsappUrl: T.whatsappUrl(intlPhone(o.customer.phone, store.settings.whatsapp), T.orderMessage(o, event, store.settings, orderUrl(req, o))) });
   });
 
   admin.put('/orders/:id', (req, res) => {
@@ -596,9 +776,11 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
       if (b.status === 'paid' && !o.paidAt) patch.paidAt = new Date(nowMs()).toISOString();
     }
     if (b.notes !== undefined) patch.customer = { ...o.customer, notes: str(b.notes, 500) };
+    const becamePaid = patch.status === 'paid' && o.status !== 'paid';
     store.updateOrder(o.id, patch);
+    if (becamePaid) deliverTickets(o, baseUrl(req));
     const e = store.event(o.eventId);
-    res.json({ ...orderRow(o), whatsappUrl: e ? T.whatsappUrl(intlPhone(o.customer.phone, store.settings.whatsapp), T.orderMessage(o, e, store.settings, orderUrl(req, o))) : '' });
+    res.json({ ...orderRow(o), autoSent: becamePaid && autoWa('tickets'), whatsappUrl: e ? T.whatsappUrl(intlPhone(o.customer.phone, store.settings.whatsapp), T.orderMessage(o, e, store.settings, orderUrl(req, o))) : '' });
   });
 
   admin.get('/orders/:id/whatsapp', (req, res) => {
@@ -661,9 +843,8 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
   });
 
   admin.get('/export', (req, res) => {
-    const { settings, events, nextOrderNo } = store.db;
     res.setHeader('Content-Disposition', `attachment; filename="tazkara-backup-${now().date}.json"`);
-    res.json({ app: 'tazkara', version: 1, exportedAt: new Date().toISOString(), settings, events, nextOrderNo, orders: store.orders, tickets: store.tickets });
+    res.json(snapshot());
   });
 
   admin.post('/import', notInDemo, (req, res) => {
@@ -704,9 +885,15 @@ function createApp({ dataDir, setupCode, demo = null, quiet = false, clock = nul
     if (err.type === 'entity.too.large') return res.status(413).json({ error: 'too_large' });
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid_json' });
     console.error(err);
+    notify.alertError(store, 'Tazkara', err);
     res.status(500).json({ error: 'server_error' });
   });
 
+  if (!demo) {
+    backup.schedule(store, { snapshot, mailer, alert: (text) => notify.alertOwner(store, text), appName: 'Tazkara' });
+    setInterval(sendReminders, 60 * 60 * 1000).unref();
+  }
+  app.locals.runReminders = sendReminders;
   app.locals.store = store;
   app.locals.setupCode = store.db.setupCode;
   app.locals.eventStats = eventStats;

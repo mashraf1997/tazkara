@@ -105,8 +105,19 @@ function homeHeader({ s, t, lang, languages }) {
 
 const footer = (s, t) => `<footer class="footer">
   ${s.about || s.policy ? `<section class="info-card">${s.about ? `<p>${esc(s.about)}</p>` : ''}${s.policy ? `<h3>${icon('file')}${esc(t.policy)}</h3><p class="muted">${esc(s.policy)}</p>` : ''}</section>` : ''}
-  <p class="powered">${esc(t.poweredBy)} <a href="https://github.com/mashraf1997/tazkara" target="_blank" rel="noopener">Tazkara</a></p>
+  ${powered(s, t)}
 </footer>`;
+
+/** "Powered by" line; agencies can rename it or hide it (white-label). */
+function powered(s, t) {
+  const b = s._brand;
+  if (b && b.hideBranding) return '';
+  if (b && b.name) {
+    const u = safeUrl(b.url);
+    return `<p class="powered">${esc(t.poweredBy)} ${u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(b.name)}</a>` : esc(b.name)}</p>`;
+  }
+  return `<p class="powered">${esc(t.poweredBy)} <a href="https://github.com/mashraf1997/tazkara" target="_blank" rel="noopener">Tazkara</a></p>`;
+}
 
 /** Date badge: big day number + short month. */
 function dateBadge(date, lang) {
@@ -275,7 +286,7 @@ function eventSummary(e, s, t, lang) {
   return `<a class="ev-mini" href="/e/${esc(e.slug)}">${coverArt(e, 'ev-thumb')}<div><b>${esc(e.title)}</b><small>${esc(whenText(e, lang, t))}</small>${e.venue ? `<small>${icon('pin', 'i xs')}${esc(e.venue)}</small>` : ''}</div></a>`;
 }
 
-function renderOrderPage({ settings: s, order: o, state, event: e, tickets, lang, baseUrl }) {
+function renderOrderPage({ settings: s, order: o, state, event: e, tickets, lang, baseUrl, payOnline = false, payPending = false }) {
   const t = strings(lang);
   const theme = cleanTheme(s.theme);
   const digits = String(s.whatsapp || '').replace(/\D/g, '');
@@ -286,7 +297,8 @@ function renderOrderPage({ settings: s, order: o, state, event: e, tickets, lang
     banner = `<div class="banner warn"><h1>${icon('clock')}${esc(fill(t.payToConfirm, { amount: T.formatMoney(o.total, s.currency) }))}</h1>
       ${s.paymentInfo ? `<p class="pay-info">${esc(s.paymentInfo)}</p>` : ''}
       <p class="muted small">${esc(s.holdHours ? fill(t.holdHint, { hours: s.holdHours }) : t.pendingHint)}</p>
-      <div class="pay-acts">${safeUrl(s.paymentLink) ? `<a class="btn" href="${esc(safeUrl(s.paymentLink))}" target="_blank" rel="noopener">${icon('cash')}${esc(t.payNow)}</a>` : ''}${digits ? `<a class="btn wa" href="https://wa.me/${esc(digits)}?text=${esc(encodeURIComponent(receipt))}" target="_blank" rel="noopener">${icon('whatsapp')}${esc(t.sendReceipt)}</a>` : ''}</div></div>`;
+      ${payPending ? `<p class="pay-confirming">${icon('clock', 'i xs')}${esc(t.payConfirming)}</p>` : ''}
+      <div class="pay-acts">${payOnline ? `<button type="button" class="btn pay-online" data-pay-online="${esc(o.token)}">${icon('cash')}${esc(t.payOnline)}</button>` : ''}${!payOnline && safeUrl(s.paymentLink) ? `<a class="btn" href="${esc(safeUrl(s.paymentLink))}" target="_blank" rel="noopener">${icon('cash')}${esc(t.payNow)}</a>` : ''}${digits ? `<a class="btn wa" href="https://wa.me/${esc(digits)}?text=${esc(encodeURIComponent(receipt))}" target="_blank" rel="noopener">${icon('whatsapp')}${esc(t.sendReceipt)}</a>` : ''}</div></div>`;
   } else banner = `<div class="banner bad"><h1>${icon('x-circle')}${esc(state === 'expired' ? t.orderExpired : t.orderCancelled)}</h1>${e ? `<a class="btn" href="/e/${esc(e.slug)}">${esc(t.getTickets)}</a>` : ''}</div>`;
   return `${head({ s, lang, t, title: `${t.yourTickets} — ${e ? e.title : s.name}`, description: s.name, baseUrl, robots: 'noindex' })}
 <body class="theme-${theme} order-page">
@@ -339,6 +351,7 @@ function renderScanPage({ settings: s, event: e, token, lang, languages = [] }) 
   <header class="kiosk-head"><span class="k-logo">${esc(e.emoji || '🎟️')}</span><div><b>${esc(e.title)}</b><small>${esc(T.dateLabel(e.date, lang, { weekday: 'short', day: 'numeric', month: 'short' }))} · ${esc(T.timeLabel(e.start, lang))}</small></div>
     ${languages.length > 1 ? `<select id="lang" aria-label="${esc(t.language)}">${languages.map((l) => `<option value="${esc(l.code)}"${l.code === lang ? ' selected' : ''}>${esc(l.name)}</option>`).join('')}</select>` : ''}</header>
   <div class="counter"><b id="cnt">–</b><span>${esc(t.checkedIn)}</span></div>
+  <p class="net-badge" id="net" role="status" hidden></p>
   <section class="kiosk-scan">
     <div class="viewfinder" id="vf"><video id="video" playsinline muted></video><span class="corners"></span><button type="button" class="btn" id="start">${icon('qr')}${esc(t.startCamera)}</button></div>
     <p>${esc(t.scanHint)}</p>

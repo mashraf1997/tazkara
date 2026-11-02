@@ -27,12 +27,131 @@
   }
   result.addEventListener('click', () => (result.hidden = true));
 
+  // ------------------------------------------------------------ offline mode
+  // A copy of this event's tickets (hashed codes) lives on the device. When the
+  // network fails, scans are checked against it and queued, then synced.
+  const KEY = `tz_door_${K.token.slice(0, 12)}`;
+  const load = () => {
+    try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; }
+  };
+  let cache = load();
+  cache.queue = cache.queue || [];
+  const persist = () => {
+    try { localStorage.setItem(KEY, JSON.stringify(cache)); } catch { /* full or blocked */ }
+  };
+  const POST = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tazkara': '1' }, body: JSON.stringify(body) });
+  async function sha(text) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
+  }
+  const tokenOf = (code) => {
+    const raw = String(code || '').trim();
+    const m = /\/t\/([\w-]{8,40})/.exec(raw);
+    return m ? m[1] : /^[\w-]{8,40}$/.test(raw) ? raw : '';
+  };
+  let offline = false;
+  function badge() {
+    const b = $('#net');
+    if (!b) return;
+    const n = cache.queue.length;
+    b.hidden = !offline && !n;
+    b.className = `net-badge ${offline ? 'off' : 'sync'}`;
+    b.textContent = offline ? `${t.offlineMode}${n ? ` · ${fill(t.toSync, { n })}` : ''}` : fill(t.toSync, { n });
+  }
+  async function pull() {
+    try {
+      const r = await fetch(`${base}/list`);
+      if (!r.ok) return;
+      const d = await r.json();
+      // Keep local check-ins the server hasn't seen yet.
+      const local = new Map((cache.tickets || []).filter((x) => x.localUsed).map((x) => [x.h, x]));
+      d.tickets.forEach((x) => {
+        const l = local.get(x.h);
+        if (l && !x.usedAt) Object.assign(x, { usedAt: l.usedAt, localUsed: true, reason: 'used' });
+      });
+      cache = { ...cache, at: d.at, tickets: d.tickets };
+      persist();
+      offline = false;
+      setCount(d);
+    } catch {
+      offline = true;
+    }
+    badge();
+  }
+  async function flush() {
+    if (!cache.queue.length) return;
+    const batch = cache.queue.slice(0, 200);
+    try {
+      const r = await POST(`${base}/sync`, { scans: batch });
+      if (!r.ok) return;
+      const d = await r.json();
+      cache.queue = cache.queue.slice(batch.length);
+      persist();
+      offline = false;
+      setCount(d);
+      if (d.conflicts) show(`<div class="big">${ic('x-circle')}</div><h2>${esc(fill(t.syncConflicts, { n: d.conflicts }))}</h2>`, 'warn');
+    } catch {
+      offline = true;
+    }
+    badge();
+  }
+  async function checkOffline(code) {
+    const tok = tokenOf(code);
+    const list = cache.tickets || [];
+    const h = tok && crypto.subtle ? await sha(tok) : '';
+    const x = h && list.find((y) => y.h === h);
+    if (!x) return { notFound: true };
+    if (x.reason && x.reason !== 'used') return { ...x, ok: false };
+    if (x.usedAt) return { ...x, ok: false, reason: 'used' };
+    x.usedAt = new Date().toISOString();
+    x.localUsed = true;
+    x.reason = 'used';
+    cache.queue.push({ code: tok, at: x.usedAt });
+    persist();
+    return { ...x, ok: true, usedAt: x.usedAt, offline: true };
+  }
+  window.addEventListener('online', () => flush().then(pull));
+  window.addEventListener('offline', () => {
+    offline = true;
+    badge();
+  });
+
   async function onCode(code) {
     if (busy) return;
     busy = true;
     try {
-      const res = await fetch(`${base}/checkin`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tazkara': '1' }, body: JSON.stringify({ code }) });
-      const r = await res.json().catch(() => ({}));
+      let res;
+      let r;
+      try {
+        if (offline && !navigator.onLine) throw new Error('offline');
+        res = await fetch(`${base}/checkin`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tazkara': '1' }, body: JSON.stringify({ code }), signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined });
+        r = await res.json().catch(() => ({}));
+        if (offline) {
+          offline = false;
+          flush();
+        }
+      } catch {
+        // No network: decide on the device.
+        offline = true;
+        r = await checkOffline(code);
+        badge();
+        if (r.notFound) {
+          window.QrScanner.beep(false);
+          return show(`<div class="big">${ic('x-circle')}</div><h2>${esc(t.unknownTicket)}</h2><p>${esc(t.offlineUnknown)}</p>`, 'bad');
+        }
+        res = { ok: true, status: 200 };
+      }
+      if (!r.offline && r.ok !== undefined && res.ok) {
+        // Server answered: keep the local copy in step.
+        const tok = tokenOf(code);
+        if (tok && crypto.subtle && cache.tickets) {
+          sha(tok).then((h) => {
+            const x = cache.tickets.find((y) => y.h === h);
+            if (x && r.usedAt) Object.assign(x, { usedAt: r.usedAt, reason: 'used' });
+            persist();
+          });
+        }
+      }
       if (res.status === 404) {
         window.QrScanner.beep(false);
         return show(`<div class="big">${ic('x-circle')}</div><h2>${esc(t.unknownTicket)}</h2>`, 'bad');
@@ -75,9 +194,10 @@
     navigator.permissions.query({ name: 'camera' }).then((p) => p.state === 'granted' && start()).catch(() => {});
   }
 
-  const refresh = () => fetch(`${base}/stats`).then((r) => r.json()).then(setCount).catch(() => {});
-  refresh();
-  setInterval(refresh, 15000);
+  window.QrScanner.preload();
+  pull().then(flush);
+  setInterval(() => flush().then(pull), 60000);
+  badge();
 
   const langSel = $('#lang');
   if (langSel) langSel.addEventListener('change', () => {

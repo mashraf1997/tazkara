@@ -161,6 +161,20 @@
       if (e.key === 'Enter') input.blur();
     });
   }
+  // Pay a pending order online: the server returns the provider's checkout page.
+  const payBtn = $('[data-pay-online]');
+  if (payBtn) {
+    payBtn.addEventListener('click', async () => {
+      payBtn.disabled = true;
+      try {
+        const r = await api('POST', `/api/orders/${encodeURIComponent(payBtn.dataset.payOnline)}/checkout`, {});
+        location.href = r.url;
+      } catch {
+        toast(t.payFailed);
+        payBtn.disabled = false;
+      }
+    });
+  }
   document.addEventListener('click', async (e) => {
     const b = e.target.closest('[data-send]');
     if (!b) return;

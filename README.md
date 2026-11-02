@@ -48,7 +48,8 @@ Tazkara runs on your own server, with your own domain:
 - 🎨 4 themes, 5 Arabic-friendly fonts, any colour, logo and cover, with a live preview
 
 **For the server**
-- Node.js + Express, **3 small dependencies**, no database to set up (atomic JSON files)
+- 🔌 **Optional connections**: online payments (Paymob, Stripe), automatic WhatsApp messages, email, phone notifications, daily backups ([details](#connections-optional))
+- Node.js + Express, **4 small dependencies**, no database to set up (atomic JSON files)
 - Runs on the smallest VPS. Docker image for `amd64` and `arm64`, tested on Node 18–24.
 - **Automatic HTTPS** with Caddy, **setup code** to protect a fresh install, **demo mode**
 - **Agency mode**: one server runs ticketing for many organizers, each on their own domain
@@ -110,7 +111,7 @@ npm start
 
 ## How payments work
 
-Tazkara never touches the money, so there are no fees and no payment keys to manage.
+By default Tazkara never touches the money, so there are no fees and no payment keys to manage. Prefer automatic? Connect Paymob or Stripe and tickets unlock as soon as the buyer pays ([Connections](#connections-optional)).
 
 1. In **Settings → Payments**, write how people pay (e.g. `InstaPay: you@instapay · Vodafone Cash 010…`) and optionally add a payment link.
 2. A buyer reserves paid tickets. Their order page shows the amount, your details, a **Pay now** button and **Send payment receipt** (opens WhatsApp to you).
@@ -120,6 +121,52 @@ Tazkara never touches the money, so there are no fees and no payment keys to man
 ## The door scanner
 
 Every event has a secret **door scanner link** (Events → ⋯ → Door scanner link). Send it to your team; they open it on their phones, allow the camera, and scan. Each ticket can be used once, and the screen shows green for valid tickets and orange or red for used, unpaid, cancelled or wrong-event tickets. If a link leaks, press **Change link** and the old one stops working.
+
+## Connections (optional)
+
+Everything works without these. Turn on only what you need in **Admin → Connections**. Keys and passwords stay on your server: they are never sent to the browser and never included in exports or backups.
+
+### Online payments: Paymob or Stripe
+
+With a payment provider connected, buyers pay for their tickets on the order page and the QR codes unlock on their own, no need to check transfers.
+
+- **Paymob** (Egypt, Saudi Arabia, UAE, Oman, Pakistan): paste your secret key, public key, HMAC secret and integration IDs from the Paymob dashboard, then paste the callback URL shown in the panel as the *Transaction processed callback*.
+- **Stripe** (worldwide): paste your secret key (`sk_live_…` or `sk_test_…`). Optionally add a webhook to `https://your-domain/webhooks/stripe` for `checkout.session.completed` and paste its signing secret.
+- Each payment is checked with the provider when the customer comes back, and again by the webhook if they close the page. The amount and currency are verified and a payment is counted only once. Use test keys and **Open a test payment** to try it.
+- Your manual payment details and payment link still work when no provider is connected.
+
+### Automatic WhatsApp messages (WhatsApp Cloud API)
+
+Without this, the one-tap WhatsApp links keep working as before. With it, these messages go out on their own from your business number:
+
+| Message | Sent when | Template name |
+|---|---|---|
+| Tickets confirmed | the order is paid (online, or you press **Payment received**) | `tazkara_tickets` |
+| Day-before reminder | the day before the event, after 10:00 | `tazkara_reminder` |
+
+1. Create an app at [Meta for Developers](https://developers.facebook.com/) with the WhatsApp product, and copy the **phone number ID** and a **permanent access token** (system user).
+2. WhatsApp only lets businesses start conversations with approved templates. Create each template with the exact text shown in the panel (copy button), wait for approval, then switch it on.
+3. **Send test** sends Meta's `hello_world` template to check the connection. Meta bills business-initiated conversations according to its own pricing.
+
+### Email (SMTP)
+
+Use any mailbox, for example your Hostinger email (`smtp.hostinger.com`, port 465 with SSL/TLS, or 587). With email set up, buyers who leave an email get their tickets with a calendar invite, the payment instructions while the order waits, and a reminder the day before. Alerts and the daily backup copy can each be switched on or off.
+
+### Notifications on this device
+
+The admin can be installed on your phone's home screen like an app. Press **Turn on notifications** on each device that should get an instant notification for new activity, no Telegram needed (on iPhone, add the admin to the home screen first; iOS 16.4+). Telegram alerts still work too.
+
+### Automatic daily backups
+
+Every day the app saves a backup to `DATA_DIR/backups/` and keeps the last 14 days. Download any of them from the panel, or press **Back up now**. Turn on **Email me the daily backup** to keep a gzipped copy off the server. To restore, use **Settings → Backup → Restore backup**. If the app hits an error or a backup fails, you get an alert (at most once an hour).
+
+### White-label (agency mode)
+
+In the agency panel (`/hub` → Settings), set your agency name and website: every client page then says "powered by *your agency*" instead of Tazkara, or you can hide the line completely. Client login screens show your name too.
+
+### Door scanner without internet
+
+Venues often have bad signal. The door scanner keeps a copy of the event's ticket list on the phone (only hashed codes, so the list can't be turned into tickets). If the connection drops, it keeps checking people in on the phone, shows an **Offline** badge with the number of scans waiting, and syncs them as soon as the internet is back. If two doors let the same ticket in while offline, you get a warning after the sync. Open the scanner page while you still have internet and keep it open.
 
 ## Agency mode, branches and Telegram
 
